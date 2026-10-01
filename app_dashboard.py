@@ -1,17 +1,4 @@
-"""Dashboard peringatan dini tata kelola yayasan-PT (contoh/prototipe).
 
-Jalankan:
-    pip install streamlit pandas rapidfuzz openpyxl plotly
-    streamlit run app_dashboard.py
-
-Sumber data (urutan prioritas):
-1. Database, bila DB_URL diisi (lihat fungsi ambil_url). Perlu: pip install sqlalchemy
-2. Unggah template Excel master (sheet: yayasan, pt, organ_yayasan, pimpinan_pt, aturan_statuta, dst.)
-3. Data contoh fiktif bawaan (buat_sample.py), agar dashboard tetap bisa dicoba tanpa data.
-
-Perhitungan flag (F) dan indikator risiko (R) ada di indikator.py -- pisahkan logika dari tampilan
-supaya mudah diuji dan diperluas.
-"""
 import os
 from pathlib import Path
 
