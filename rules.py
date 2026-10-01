@@ -12,7 +12,7 @@ from pathlib import Path
 import pandas as pd
 from dateutil.relativedelta import relativedelta
 
-CFG_PATH = Path(__file__).parent / "rules_config.json"
+CFG_PATH = Path(__C:\Users\user\Downloads\ews_prototipe (1)\ews\data\Contoh_Data_50_Yayasan__).parent / "rules_config.json"
 RANK = {"Hijau": 1, "Kuning": 2, "Merah": 3}
 
 RULES = {
