@@ -1,0 +1,11 @@
+{
+  "parameter": {
+    "toleransi_hari_masa_jabatan": 31,
+    "batas_bulan_plt_pj": 6,
+    "jendela_bulan_pasca_perubahan_ad": 12
+  },
+  "aktif": {
+    "PT-01": false,
+    "PT-07": false
+  }
+}
