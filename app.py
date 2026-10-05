@@ -373,6 +373,14 @@ elif page == "Log & Riwayat Status":
     with t2:
         a = db.read_log("audit_log")
         st.dataframe(a.drop(columns="id"), hide_index=True, width="stretch") if len(a) else st.info("Belum ada perubahan data.")
+    with t3:
+        conn = sqlite3.connect("ews.db")
+        # Mengambil data username dan nama lengkap (tanpa menampilkan hash password demi keamanan)
+        users_df = pd.read_sql_query("SELECT username, nama_lengkap FROM users", conn)
+        conn.close()
+        
+        st.caption(f"Total pengguna terdaftar: {len(users_df)}")
+        st.dataframe(users_df, hide_index=True, use_container_width=True)
 
 # ---------------- Aturan ----------------
 else:
