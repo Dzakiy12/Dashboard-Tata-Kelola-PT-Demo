@@ -1,272 +1,334 @@
-"""Mesin aturan Early Warning System (deterministik, bisa diaudit).
+"""Perhitungan flag pelanggaran (F) dan indikator risiko (R) dari template master data.
 
-Status per entitas = temuan terburuk: Merah > Kuning > Hijau.
-Setiap temuan menyimpan kode aturan, uraian, dan dasar (pasal statuta) agar bisa dijelaskan.
-
-CATATAN: aturan di bawah adalah USULAN AWAL berdasarkan kolom data. Harus divalidasi ahli hukum
-sebelum dipakai untuk keputusan nyata.
+Semua fungsi menerima `s`: dict nama_sheet -> DataFrame (hasil pd.read_excel(sheet_name=None)).
+Ambang batas (AMBANG_*) adalah usulan awal untuk didiskusikan bersama pakar kelembagaan,
+lalu diuji terhadap kasus yang sudah diketahui sebelum dipakai sebagai dasar keputusan.
 """
-import json
 from datetime import date
-from pathlib import Path
+
+import numpy as np
 import pandas as pd
-from dateutil.relativedelta import relativedelta
+from rapidfuzz import fuzz
 
-CFG_PATH = Path(__file__).parent / "rules_config.json"
-RANK = {"Hijau": 1, "Kuning": 2, "Merah": 3}
-
-RULES = {
-    "PIM-01": ("Penjaringan calon pimpinan", "Statuta mewajibkan penjaringan, tetapi dokumennya tidak ada (kuning jika statuta tidak mengatur)."),
-    "PIM-02": ("Pertimbangan senat saat pengangkatan", "Statuta mewajibkan pertimbangan senat, tetapi dokumennya tidak ada (kuning jika tidak diatur)."),
-    "PIM-03": ("Rangkap jabatan dengan organ yayasan", "Merah jika statuta melarang rangkap; kuning jika tidak diatur atau status rangkap tidak diketahui."),
-    "PIM-04": ("Prosedur pemberhentian", "Pemberhentian tanpa dokumen padahal prosedur diatur (merah); tidak diatur/tidak diketahui (kuning)."),
-    "PIM-05": ("Masa jabatan", "Jabatan melewati masa jabatan menurut statuta (+ toleransi hari)."),
-    "PIM-06": ("Jumlah periode jabatan", "Seseorang menjabat lebih dari batas maksimum periode menurut statuta."),
-    "PIM-07": ("Tanggal SK pengangkatan", "SK pengangkatan terbit setelah jabatan dimulai."),
-    "PIM-08": ("Pimpinan non-definitif (Plt/Pj)", "Plt/Pj menjabat lebih lama dari batas bulan."),
-    "PIM-09": ("Statuta berlaku saat pengangkatan", "Tidak ada versi statuta yang berlaku pada tanggal pengangkatan."),
-    "PIM-10": ("Pengangkatan setelah perubahan AD", "Pimpinan diangkat dalam jendela waktu setelah perubahan AD yang menyentuh kewenangan pimpinan PT."),
-    "PIM-11": ("Konsistensi data rangkap", "Data menyatakan tidak rangkap, tetapi nama sama dengan organ yayasan aktif."),
-    "PT-01": ("Akreditasi PT", "Akreditasi kedaluwarsa atau belum terakreditasi."),
-    "PT-02": ("Status PT", "PT dalam pembinaan atau tidak aktif."),
-    "PT-03": ("Penyelenggara aktif", "PT harus punya tepat satu penyelenggara aktif yang sama dengan yayasan di data PT."),
-    "PT-04": ("Alih kelola", "Alih kelola tanpa nomor SK (merah); karena sengketa/sanksi (kuning)."),
-    "PT-05": ("Statuta PT", "PT tidak memiliki statuta."),
-    "PT-06": ("Kewenangan akademik yayasan", "Statuta memberi yayasan kewenangan akademik."),
-    "PT-07": ("Statuta belum disesuaikan dengan AD", "Statuta lebih lama daripada perubahan AD yayasan yang menyentuh pimpinan PT."),
-    "PT-08": ("Kekosongan pimpinan", "PT aktif tanpa pimpinan yang sedang menjabat."),
-    "YAY-01": ("Status yayasan", "Yayasan bersengketa/tidak aktif."),
-    "YAY-02": ("Organ yayasan", "Lebih dari satu Ketua Pengurus berjalan (merah); organ wajib tidak lengkap (kuning)."),
-    "YAY-03": ("Kesesuaian SK badan hukum", "Nomor SK badan hukum berbeda dengan SK pada akta pendirian."),
-}
+HARI_INI = pd.Timestamp(date.today())
+FAR = pd.Timestamp("2100-01-01")
+TGL_SE_RANGKAP = pd.Timestamp("2021-03-26")  # SE Dirjen Dikti No. 3/2021; verifikasi status hukum ke tim hukum
+AMBANG_NAMA = 92
+JENDELA_TAHUN = 3          # jendela "3 tahun terakhir" untuk R1, R4
+JENDELA_BERSAMAAN_HARI = 183  # ~6 bulan, untuk R8/R9
+GELAR = {"prof", "dr", "drs", "dra", "ir", "h", "hj", "s.h", "m.h", "s.e", "m.m",
+         "m.si", "s.t", "m.t", "s.kom", "m.kom", "m.pd", "s.pd", "s.sos", "m.a"}
 
 
-def load_cfg():
-    try:
-        cfg = json.loads(CFG_PATH.read_text())
-    except Exception:
-        cfg = {}
-    cfg.setdefault("parameter", {})
-    cfg["parameter"].setdefault("toleransi_hari_masa_jabatan", 31)
-    cfg["parameter"].setdefault("batas_bulan_plt_pj", 6)
-    cfg["parameter"].setdefault("jendela_bulan_pasca_perubahan_ad", 12)
-    cfg.setdefault("aktif", {})
-    return cfg
+# ---------- util ----------
+def _norm_nama(nama):
+    if pd.isna(nama):
+        return ""
+    kata = [k.strip(".") for k in str(nama).lower().replace(",", " ").split()]
+    kata = [k for k in kata if k and k not in GELAR]
+    return " ".join("".join(ch for ch in k if ch.isalpha()) for k in kata).strip()
 
 
-def save_cfg(cfg):
-    CFG_PATH.write_text(json.dumps(cfg, indent=2, ensure_ascii=False))
+def _akhir_efektif(seri_tanggal):
+    return seri_tanggal.fillna(FAR)
 
 
-def _d(df, cols):
-    df = df.copy()
-    for c in cols:
-        if c in df.columns:
-            df[c] = pd.to_datetime(df[c], errors="coerce")
+def _ya(nilai):
+    return nilai.isin(["Ya", "Dilarang"])
+
+
+def _get(s, nama, kolom=None):
+    df = s.get(nama, pd.DataFrame()).copy()
+    if kolom:
+        for c in kolom:
+            if c not in df.columns:
+                df[c] = pd.NA
+        df = df[kolom]
+    for c in [c for c in df.columns if str(c).startswith("tgl_")]:
+        df[c] = pd.to_datetime(df[c], errors="coerce")
     return df
 
 
-def _v(x):
-    return None if pd.isna(x) else x
-
-
-def _norm(s):
-    return str(s).strip().lower() if not pd.isna(s) else ""
-
-
-def evaluate(data, cfg=None, today=None, include_historis=True):
-    cfg = cfg or load_cfg()
-    P = cfg["parameter"]
-    on = lambda code: cfg["aktif"].get(code, True)
-    today = pd.Timestamp(today or date.today())
-
-    yy = data["yayasan"]
-    pt = data["pt"]
-    pen = _d(data["riwayat_penyelenggara"], ["tgl_mulai", "tgl_akhir"])
-    akta = _d(data["akta"], ["tgl_akta", "tgl_berlaku"])
-    organ = _d(data["organ_yayasan"], ["tgl_mulai", "tgl_akhir"])
-    pim = _d(data["pimpinan_pt"], ["tgl_mulai", "tgl_akhir", "tgl_sk_pengangkatan"])
-    sta = _d(data["aturan_statuta"], ["tgl_berlaku", "tgl_berakhir"]).sort_values("tgl_berlaku")
-    per = _d(data["riwayat_perubahan"], ["tgl_perubahan"])
-    pt_yay = dict(zip(pt.kode_pt, pt.id_yayasan))
-    F = []
-
-    def add(code, tingkat, level, yid, kpt, ref, uraian, aktif=True, dasar=""):
-        if on(code):
-            F.append(dict(tingkat=tingkat, kode_aturan=code, level=level, id_yayasan=yid, kode_pt=kpt,
-                          referensi=ref, uraian=uraian, dasar=dasar, aktif=bool(aktif)))
-
-    sta_by_pt = {k: g for k, g in sta.groupby("kode_pt")}
-
-    def pick(kpt, tgl):
-        g = sta_by_pt.get(kpt)
-        if g is None or pd.isna(tgl):
-            return None, False
-        ok = g[(g.tgl_berlaku <= tgl) & (g.tgl_berakhir.isna() | (g.tgl_berakhir >= tgl))]
-        return (ok.iloc[-1], True) if len(ok) else (g.iloc[0], False)
-
-    # perubahan AD yang menyentuh kewenangan pimpinan PT, per yayasan
-    ad_dates = {}
-    for _, a in akta[akta.ubah_kewenangan_terhadap_pt == "Ya"].iterrows():
-        ad_dates.setdefault(a.id_yayasan, set()).add(a.tgl_berlaku)
-    for _, r in per[(per.jenis_dokumen == "Anggaran Dasar") & (per.menyentuh_pasal_pimpinan == "Ya")].iterrows():
-        ad_dates.setdefault(r.id_entitas, set()).add(r.tgl_perubahan)
-
-    # ---------- aturan pimpinan ----------
-    pim = pim.sort_values(["kode_pt", "nama_lengkap", "tgl_mulai"])
-    periode_ke = pim.groupby(["kode_pt", pim.nama_lengkap.map(_norm)]).cumcount() + 1
-    for (i, p), n in zip(pim.iterrows(), periode_ke.loc[pim.index]):
-        s, valid = pick(p.kode_pt, p.tgl_sk_pengangkatan if not pd.isna(p.tgl_sk_pengangkatan) else p.tgl_mulai)
-        akt = pd.isna(p.tgl_akhir) or p.tgl_akhir > today
-        ref = f"{p.id_pimpinan} - {p.nama_lengkap} ({p.jabatan_pt})"
-        kw = dict(level="Pimpinan", yid=p.id_yayasan, kpt=p.kode_pt, ref=ref, aktif=akt)
-        if s is None:
-            add("PIM-09", "Kuning", uraian="Statuta PT tidak ditemukan; aturan pimpinan tidak bisa diuji.", **kw)
+def buang_contoh(s):
+    """Buang baris contoh (id berawalan CONTOH-) yang tersisa dari template yang belum diisi penuh."""
+    out = {}
+    for k, df in s.items():
+        if df.empty or df.columns.empty:
+            out[k] = df
             continue
-        if not valid:
-            add("PIM-09", "Kuning", uraian=f"Tidak ada statuta yang berlaku pada tanggal pengangkatan "
-                f"({p.tgl_sk_pengangkatan:%d-%m-%Y}); diuji dengan statuta {s.versi_statuta}.", **kw)
-        pasal_a, pasal_b = _v(s.pasal_pengangkatan) or "", _v(s.pasal_pemberhentian) or ""
-        da = f"{s.versi_statuta}, {pasal_a}"
-        db_ = f"{s.versi_statuta}, {pasal_b}"
-        # 01 penjaringan
-        if p.ada_dok_penjaringan == "Tidak":
-            if s.wajib_penjaringan == "Ya":
-                add("PIM-01", "Merah", uraian="Statuta mewajibkan penjaringan, dokumen penjaringan tidak ada.", dasar=da, **kw)
+        kol_id = df.columns[0]
+        out[k] = df[~df[kol_id].astype(str).str.startswith("CONTOH", na=False)].reset_index(drop=True)
+    return out
+
+
+# ---------- F1 & F2: rangkap jabatan yayasan <-> pimpinan PT ----------
+def hitung_f1_f2(s):
+    o = _get(s, "organ_yayasan", ["id_organ", "id_yayasan", "id_akta_sumber", "nama_lengkap", "nik",
+                                  "jabatan_yayasan", "tgl_mulai", "tgl_akhir"])
+    p = _get(s, "pimpinan_pt", ["id_pimpinan", "kode_pt", "id_yayasan", "nama_lengkap", "nik", "jabatan_pt",
+                                "status_definitif", "tgl_mulai", "tgl_akhir", "no_sk_pengangkatan"])
+    if o.empty or p.empty:
+        return pd.DataFrame()
+    m = o.merge(p, on="id_yayasan", suffixes=("_org", "_pim"))
+    if m.empty:
+        return m
+    nik_sama = m["nik_org"].notna() & (m["nik_org"].astype(str) == m["nik_pim"].astype(str))
+    m["skor_nama"] = [fuzz.token_sort_ratio(_norm_nama(a), _norm_nama(b))
+                      for a, b in zip(m["nama_lengkap_org"], m["nama_lengkap_pim"])]
+    m["keyakinan"] = np.where(nik_sama, "Tinggi (NIK sama)", "Perlu verifikasi (nama mirip)")
+    m["irisan_mulai"] = m[["tgl_mulai_org", "tgl_mulai_pim"]].max(axis=1)
+    m["irisan_akhir"] = pd.concat([_akhir_efektif(m["tgl_akhir_org"]), _akhir_efektif(m["tgl_akhir_pim"])], axis=1).min(axis=1)
+    f = m[(nik_sama | (m["skor_nama"] >= AMBANG_NAMA)) & (m["irisan_mulai"] <= m["irisan_akhir"])].copy()
+    if f.empty:
+        return f
+    f["id_temuan"] = "F1-" + f["id_organ"].astype(str) + "-" + f["id_pimpinan"].astype(str)
+    akhir = f["irisan_akhir"].where(f["irisan_akhir"] < FAR, HARI_INI)
+    f["lama_bulan"] = ((akhir - f["irisan_mulai"]).dt.days / 30.4).round().astype(int)
+    f["setelah_se_rangkap"] = f["irisan_akhir"] >= TGL_SE_RANGKAP
+
+    a = _get(s, "aturan_statuta", ["kode_pt", "versi_statuta", "tgl_berlaku", "tgl_berakhir",
+                                    "larangan_rangkap_organ_yayasan", "pasal_pengangkatan", "kutipan_pengangkatan"])
+    x = f[["id_temuan", "kode_pt", "irisan_mulai"]].merge(a, on="kode_pt", how="left")
+    berlaku = (x["tgl_berlaku"] <= x["irisan_mulai"]) & (x["tgl_berakhir"].isna() | (x["tgl_berakhir"] >= x["irisan_mulai"]))
+    f = f.merge(x[berlaku].drop(columns=["kode_pt", "irisan_mulai"]), on="id_temuan", how="left")
+    f["f2"] = _ya(f["larangan_rangkap_organ_yayasan"].fillna(""))
+    f = f.merge(_get(s, "pt", ["kode_pt", "nama_pt"]), on="kode_pt", how="left")
+    f = f.merge(_get(s, "yayasan", ["id_yayasan", "nama_yayasan"]), on="id_yayasan", how="left")
+    return f.reset_index(drop=True)
+
+
+# ---------- F3: jabatan melebihi ketentuan statuta ----------
+def hitung_f3(s):
+    p = _get(s, "pimpinan_pt", ["id_pimpinan", "kode_pt", "nama_lengkap", "jabatan_pt", "status_definitif",
+                                "tgl_mulai", "tgl_akhir"])
+    a = _get(s, "aturan_statuta", ["kode_pt", "versi_statuta", "tgl_berlaku", "tgl_berakhir",
+                                    "masa_jabatan_rektor_tahun"])
+    if p.empty or a.empty:
+        return pd.DataFrame()
+    m = p.merge(a, on="kode_pt")
+    berlaku = (m["tgl_berlaku"] <= m["tgl_mulai"]) & (m["tgl_berakhir"].isna() | (m["tgl_berakhir"] >= m["tgl_mulai"]))
+    m = m[berlaku].copy()
+    if m.empty:
+        return m
+    akhir = _akhir_efektif(m["tgl_akhir"]).where(lambda x: x < FAR, HARI_INI)
+    m["lama_tahun"] = (akhir - m["tgl_mulai"]).dt.days / 365.25
+    f = m[(m["status_definitif"] == "Definitif") & (m["masa_jabatan_rektor_tahun"].notna()) &
+          (m["lama_tahun"] > m["masa_jabatan_rektor_tahun"] + 0.5)].copy()
+    if f.empty:
+        return f
+    f["id_temuan"] = "F3-" + f["id_pimpinan"].astype(str)
+    f["lama_tahun"] = f["lama_tahun"].round(1)
+    return f.merge(_get(s, "pt", ["kode_pt", "nama_pt"]), on="kode_pt", how="left")
+
+
+# ---------- F6: pemberhentian dini tanpa dasar sah ----------
+def hitung_f6(s):
+    p = _get(s, "pimpinan_pt", ["id_pimpinan", "kode_pt", "nama_lengkap", "jabatan_pt", "tgl_mulai", "tgl_akhir",
+                                "alasan_berhenti", "ada_dok_pemberhentian"])
+    a = _get(s, "aturan_statuta", ["kode_pt", "versi_statuta", "tgl_berlaku", "tgl_berakhir",
+                                    "masa_jabatan_rektor_tahun", "alasan_pemberhentian_sah"])
+    p = p[p["tgl_akhir"].notna()].copy()
+    if p.empty or a.empty:
+        return pd.DataFrame()
+    m = p.merge(a, on="kode_pt")
+    berlaku = (m["tgl_berlaku"] <= m["tgl_mulai"]) & (m["tgl_berakhir"].isna() | (m["tgl_berakhir"] >= m["tgl_mulai"]))
+    m = m[berlaku].copy()
+    if m.empty:
+        return m
+    m["lama_tahun"] = (m["tgl_akhir"] - m["tgl_mulai"]).dt.days / 365.25
+    dini = m["masa_jabatan_rektor_tahun"].notna() & (m["lama_tahun"] < m["masa_jabatan_rektor_tahun"] - 0.5)
+
+    def alasan_sah(row):
+        if pd.isna(row["alasan_berhenti"]) or pd.isna(row["alasan_pemberhentian_sah"]):
+            return None
+        daftar = [x.strip().lower() for x in str(row["alasan_pemberhentian_sah"]).split(";")]
+        return str(row["alasan_berhenti"]).strip().lower() in daftar
+
+    m["alasan_sah"] = m.apply(alasan_sah, axis=1)
+    tanpa_dasar = (m["alasan_sah"] == False) | (m["ada_dok_pemberhentian"] == "Tidak")  # noqa: E712
+    f = m[dini & tanpa_dasar].copy()
+    if f.empty:
+        return f
+    f["id_temuan"] = "F6-" + f["id_pimpinan"].astype(str)
+    f["lama_tahun"] = f["lama_tahun"].round(1)
+    return f.merge(_get(s, "pt", ["kode_pt", "nama_pt"]), on="kode_pt", how="left")
+
+
+# ---------- F7: organ yayasan lewat masa jabatan tanpa akta pembaruan ----------
+def hitung_f7(s):
+    o = _get(s, "organ_yayasan", ["id_organ", "id_yayasan", "nama_lengkap", "jabatan_yayasan",
+                                  "tgl_mulai", "tgl_akhir", "status_periode"])
+    if o.empty:
+        return pd.DataFrame()
+    f = o[(o["status_periode"] == "Berjalan") & o["tgl_akhir"].notna() & (o["tgl_akhir"] < HARI_INI)].copy()
+    if f.empty:
+        return f
+    f["id_temuan"] = "F7-" + f["id_organ"].astype(str)
+    f["bulan_lewat"] = ((HARI_INI - f["tgl_akhir"]).dt.days / 30.4).round().astype(int)
+    return f.merge(_get(s, "yayasan", ["id_yayasan", "nama_yayasan"]), on="id_yayasan", how="left")
+
+
+# ---------- Indikator risiko (R) per PT, dinormalisasi 0-1 ----------
+def hitung_risiko_per_pt(s):
+    pt = _get(s, "pt", ["kode_pt", "nama_pt", "id_yayasan", "wilayah_lldikti", "jumlah_mahasiswa_aktif"])
+    yay = _get(s, "yayasan", ["id_yayasan", "nama_yayasan", "status_yayasan"])
+    pim = _get(s, "pimpinan_pt", ["kode_pt", "id_yayasan", "nama_lengkap", "jabatan_pt", "status_definitif",
+                                  "tgl_mulai", "tgl_akhir"])
+    org = _get(s, "organ_yayasan", ["id_yayasan", "tgl_mulai", "tgl_akhir"])
+    atr = _get(s, "aturan_statuta", ["kode_pt", "tgl_berlaku", "tgl_berakhir", "wajib_penjaringan",
+                                     "wajib_pertimbangan_senat", "larangan_rangkap_organ_yayasan",
+                                     "ada_senat", "ada_spi", "yayasan_berwenang_akademik"])
+    riw = _get(s, "riwayat_perubahan", ["id_entitas", "tgl_perubahan", "menyentuh_pasal_pimpinan"])
+    if pt.empty:
+        return pd.DataFrame()
+
+    batas = HARI_INI - pd.Timedelta(days=365 * JENDELA_TAHUN)
+    out = pt.merge(yay, on="id_yayasan", how="left")
+
+    # R1: frekuensi pergantian pimpinan definitif dalam 3 tahun terakhir
+    p_def = pim[pim["status_definitif"] == "Definitif"]
+    r1 = p_def[p_def["tgl_mulai"] >= batas].groupby("kode_pt").size().rename("R1_frekuensi_pergantian_pimpinan")
+    out = out.merge(r1, on="kode_pt", how="left")
+
+    # R2: berhenti sebelum masa jabatan berakhir (memakai hasil F6 sebagai proksi jumlah, tanpa detail alasan)
+    berhenti = pim[pim["tgl_akhir"].notna()].merge(
+        atr[["kode_pt", "tgl_berlaku"]], on="kode_pt", how="left")
+    r2 = berhenti.groupby("kode_pt").size().rename("R2_jumlah_pernah_berhenti")
+    out = out.merge(r2, on="kode_pt", how="left")
+
+    # R3: lama status Plt/Pj yang sedang berjalan (bulan)
+    aktif_sementara = pim[pim["status_definitif"].isin(["Plt", "Pj", "Plh"]) & pim["tgl_akhir"].isna()]
+    r3 = ((HARI_INI - aktif_sementara["tgl_mulai"]).dt.days / 30.4).round()
+    r3 = aktif_sementara.assign(R3_lama_plt_bulan=r3).groupby("kode_pt")["R3_lama_plt_bulan"].max()
+    out = out.merge(r3, on="kode_pt", how="left")
+
+    # R4: frekuensi pergantian organ yayasan dalam 3 tahun (per yayasan, disebar ke semua PT-nya)
+    r4 = org[org["tgl_mulai"] >= batas].groupby("id_yayasan").size().rename("R4_frekuensi_pergantian_organ")
+    out = out.merge(r4, on="id_yayasan", how="left")
+
+    # R7: yayasan berstatus bersengketa
+    out["R7_yayasan_bersengketa"] = (out["status_yayasan"] == "Bersengketa").astype(int)
+
+    # R9: perubahan aturan (statuta/AD) dalam <=6 bulan sebelum pergantian pimpinan (indikasi)
+    def cek_r9(kode_pt, id_yayasan):
+        mulai_baru = pim[(pim["kode_pt"] == kode_pt)]["tgl_mulai"]
+        peru = riw[(riw["id_entitas"].isin([kode_pt, id_yayasan])) & (riw["menyentuh_pasal_pimpinan"] == "Ya")]
+        if peru.empty or mulai_baru.empty:
+            return 0
+        for tp in peru["tgl_perubahan"]:
+            if ((mulai_baru - tp).dt.days.between(0, JENDELA_BERSAMAAN_HARI)).any():
+                return 1
+        return 0
+    out["R9_aturan_berubah_menjelang_pergantian"] = out.apply(
+        lambda r: cek_r9(r["kode_pt"], r["id_yayasan"]), axis=1)
+
+    # R12: kelengkapan aturan statuta -- proporsi kolom kunci yang "Tidak diatur" (versi berlaku sekarang)
+    kolom_atur = ["wajib_penjaringan", "wajib_pertimbangan_senat", "larangan_rangkap_organ_yayasan",
+                  "ada_senat", "ada_spi"]
+    berlaku_skrg = atr[atr["tgl_berlaku"] <= HARI_INI].copy()
+    berlaku_skrg = berlaku_skrg.sort_values("tgl_berlaku").groupby("kode_pt").tail(1)
+    if not berlaku_skrg.empty:
+        berlaku_skrg["R12_kelengkapan_statuta"] = berlaku_skrg[kolom_atur].apply(
+            lambda row: (row == "Tidak diatur").sum() / len(kolom_atur), axis=1)
+        out = out.merge(berlaku_skrg[["kode_pt", "R12_kelengkapan_statuta", "yayasan_berwenang_akademik"]],
+                         on="kode_pt", how="left")
+        out["R13_kewenangan_akademik_yayasan"] = (out["yayasan_berwenang_akademik"] == "Ya").astype(int)
+    else:
+        out["R12_kelengkapan_statuta"] = np.nan
+        out["R13_kewenangan_akademik_yayasan"] = 0
+
+    # R16: kepadatan pengaduan -- dilewati bila sheet pengaduan tidak tersedia di file ini
+    out["R16_pengaduan_per_1000_mhs"] = np.nan
+
+    return out
+
+
+def skor_komposit(df_risiko):
+    """Normalisasi min-max per kolom R_* lalu jumlahkan dengan bobot sama. Bobot & ambang: usulan awal,
+    perlu disepakati bersama pakar kelembagaan dan diuji terhadap kasus yang sudah diketahui."""
+    kolom_r = [c for c in df_risiko.columns if c.startswith("R") and c[1].isdigit()]
+    df = df_risiko.copy()
+    norm_cols = []
+    for c in kolom_r:
+        nilai = df[c].fillna(0)
+        rentang = nilai.max() - nilai.min()
+        df[c + "_n"] = (nilai - nilai.min()) / rentang if rentang > 0 else 0.0
+        norm_cols.append(c + "_n")
+    df["skor_risiko"] = df[norm_cols].mean(axis=1).round(3) if norm_cols else 0.0
+    df["level"] = pd.cut(df["skor_risiko"], [-0.01, 0.33, 0.66, 1.01], labels=["Hijau", "Kuning", "Merah"])
+    return df
+
+
+# Bobot keparahan per jenis flag -- usulan awal, sepakati bersama pakar kelembagaan & tim hukum sebelum dipakai
+# untuk keputusan. "berat" = flag ini sendirian sudah cukup membuat PT berlevel Merah.
+# "ringan" = perlu 2 atau lebih jenis flag "ringan" untuk naik ke Merah; 1 jenis flag ringan -> Kuning.
+FLAG_BERAT = {"F2", "F4", "F6"}   # paling pasti sebagai pelanggaran: aturan tegas & fakta jelas
+FLAG_RINGAN = {"F1", "F3", "F5", "F7"}  # indikasi kuat, tapi bisa punya penjelasan wajar / rawan data belum lengkap
+
+
+def gabungkan_level_dengan_flag(df_risiko, flag_frames):
+    """Level akhir = skor R (statistik) DITIMPA oleh flag pelanggaran, karena pelanggaran aturan
+    adalah sinyal yang lebih pasti daripada sinyal statistik semata.
+    Aturan (usulan awal, sepakati bersama pakar kelembagaan & tim hukum sebelum dipakai untuk keputusan):
+      - Ada flag "berat" (F2, F4, F6) -> langsung Merah, walau hanya satu dan walau tidak ada flag lain.
+      - Tidak ada flag berat, tapi ada >=2 jenis flag "ringan" (F1, F3, F5, F7) -> Merah (akumulasi).
+      - Tidak ada flag berat, hanya 1 jenis flag ringan -> minimal Kuning.
+      - Tidak ada flag sama sekali -> level tetap mengikuti skor R (Hijau/Kuning/Merah).
+    Catatan: F5 (tanpa dok. penjaringan/pertimbangan senat) sengaja dikelompokkan "ringan" karena nilai
+    "Tidak" pada kolom ada_dok_* bisa berarti prosesnya memang tidak dilakukan, ATAU dokumennya sekadar
+    belum diserahkan -- keduanya belum bisa dibedakan sistem tanpa verifikasi manual.
+    """
+    df = df_risiko.copy()
+    if flag_frames:
+        semua = pd.concat(flag_frames, ignore_index=True)
+        per_pt_jenis = semua.groupby("kode_pt")["_kelompok"].apply(set)
+        f2_per_pt = set(semua[semua.get("f2", False) == True]["kode_pt"]) if "f2" in semua.columns else set()  # noqa: E712
+    else:
+        per_pt_jenis = pd.Series(dtype=object)
+        f2_per_pt = set()
+
+    def jenis_flag_pt(kode_pt):
+        jenis = per_pt_jenis.get(kode_pt, set())
+        # "F1/F2" -> pecah jadi F2 kalau kode_pt ada di f2_per_pt, sisanya tetap F1
+        hasil = set()
+        for j in jenis:
+            if j == "F1/F2":
+                hasil.add("F2" if kode_pt in f2_per_pt else "F1")
             else:
-                add("PIM-01", "Kuning", uraian="Dokumen penjaringan tidak ada; statuta tidak mengatur kewajiban penjaringan.", dasar=da, **kw)
-        # 02 senat
-        if p.ada_dok_pertimbangan_senat == "Tidak":
-            if s.wajib_pertimbangan_senat == "Ya" or "senat" in str(s.pengangkat_rektor).lower():
-                add("PIM-02", "Merah", uraian="Pengangkatan wajib melalui pertimbangan senat, dokumen tidak ada.", dasar=da, **kw)
-            else:
-                add("PIM-02", "Kuning", uraian="Dokumen pertimbangan senat tidak ada; statuta tidak mengatur kewajibannya.", dasar=da, **kw)
-        # 03 rangkap
-        if p.merangkap_organ_yayasan == "Ya":
-            if s.larangan_rangkap_organ_yayasan == "Ya":
-                add("PIM-03", "Merah", uraian="Merangkap organ yayasan padahal statuta melarang.", dasar=da, **kw)
-            else:
-                add("PIM-03", "Kuning", uraian="Merangkap organ yayasan; statuta tidak mengatur larangan rangkap.", dasar=da, **kw)
-        elif p.merangkap_organ_yayasan == "Tidak diketahui":
-            add("PIM-03", "Kuning", uraian="Status rangkap jabatan dengan organ yayasan belum diketahui.", **kw)
-        else:
-            o = organ[(organ.id_yayasan == p.id_yayasan) & (organ.nama_lengkap.map(_norm) == _norm(p.nama_lengkap))
-                      & (organ.tgl_mulai <= (p.tgl_akhir if not pd.isna(p.tgl_akhir) else today))
-                      & (organ.tgl_akhir.isna() | (organ.tgl_akhir >= p.tgl_mulai))]
-            if len(o):
-                add("PIM-11", "Kuning", uraian=f"Data rangkap 'Tidak', tetapi nama sama dengan organ yayasan "
-                    f"({o.iloc[0].jabatan_yayasan}). Verifikasi.", **kw)
-        # 04 pemberhentian
-        if p.alasan_berhenti == "Diberhentikan":
-            if p.ada_dok_pemberhentian == "Tidak":
-                if s.prosedur_pemberhentian_diatur == "Ya":
-                    add("PIM-04", "Merah", uraian="Diberhentikan tanpa dokumen pemberhentian, padahal prosedur diatur statuta.", dasar=db_, **kw)
-                else:
-                    add("PIM-04", "Kuning", uraian="Diberhentikan tanpa dokumen; prosedur pemberhentian tidak diatur statuta.", dasar=db_, **kw)
-            elif p.ada_dok_pemberhentian == "Tidak diketahui":
-                add("PIM-04", "Kuning", uraian="Dokumen pemberhentian belum diketahui.", dasar=db_, **kw)
-        # 05 masa jabatan
-        masa = _v(s.masa_jabatan_rektor_tahun)
-        if masa:
-            batas = p.tgl_mulai + relativedelta(years=int(masa)) + pd.Timedelta(days=P["toleransi_hari_masa_jabatan"])
-            akhir = today if pd.isna(p.tgl_akhir) else p.tgl_akhir
-            if akhir > batas:
-                lebih = (akhir - (batas - pd.Timedelta(days=P["toleransi_hari_masa_jabatan"]))).days
-                ket = "masih menjabat" if pd.isna(p.tgl_akhir) else "menjabat"
-                add("PIM-05", "Merah", uraian=f"Pimpinan {ket} melewati masa jabatan {int(masa)} tahun sebanyak {lebih} hari.",
-                    dasar=s.versi_statuta, **kw)
-        # 06 periode
-        mx = _v(s.maks_periode_rektor)
-        if mx and n > mx:
-            add("PIM-06", "Merah", uraian=f"Menjabat periode ke-{n}, melebihi batas {int(mx)} periode.", dasar=s.versi_statuta, **kw)
-        # 07 SK
-        if not pd.isna(p.tgl_sk_pengangkatan) and p.tgl_sk_pengangkatan > p.tgl_mulai:
-            add("PIM-07", "Kuning", uraian=f"SK pengangkatan ({p.tgl_sk_pengangkatan:%d-%m-%Y}) terbit setelah jabatan dimulai ({p.tgl_mulai:%d-%m-%Y}).", **kw)
-        # 08 plt/pj
-        if p.status_definitif in ("Plt", "Pj"):
-            akhir = today if pd.isna(p.tgl_akhir) else p.tgl_akhir
-            if akhir > p.tgl_mulai + relativedelta(months=P["batas_bulan_plt_pj"]):
-                add("PIM-08", "Kuning", uraian=f"{p.status_definitif} menjabat lebih dari {P['batas_bulan_plt_pj']} bulan.", **kw)
-        # 10 pasca perubahan AD
-        for D in ad_dates.get(p.id_yayasan, []):
-            if D <= p.tgl_mulai <= D + relativedelta(months=P["jendela_bulan_pasca_perubahan_ad"]):
-                add("PIM-10", "Kuning", uraian=f"Diangkat dalam {P['jendela_bulan_pasca_perubahan_ad']} bulan setelah perubahan AD "
-                    f"({D:%d-%m-%Y}) yang menyentuh kewenangan pimpinan PT. Periksa dasar kewenangan.", **kw)
+                hasil.add(j)
+        return hasil
 
-    # ---------- aturan PT ----------
-    for _, t in pt.iterrows():
-        kw = dict(level="PT", yid=t.id_yayasan, kpt=t.kode_pt, ref=f"{t.kode_pt} - {t.nama_pt}")
-        if t.akreditasi_pt in ("Kedaluwarsa", "Belum terakreditasi"):
-            add("PT-01", "Kuning", uraian=f"Akreditasi PT: {t.akreditasi_pt}.", **kw)
-        if t.status_pt != "Aktif":
-            add("PT-02", "Kuning", uraian=f"Status PT: {t.status_pt}.", **kw)
-        ps = pen[pen.kode_pt == t.kode_pt]
-        aktif_ps = ps[ps.tgl_akhir.isna() | (ps.tgl_akhir > today)]
-        if len(aktif_ps) == 0:
-            add("PT-03", "Merah", uraian="PT tidak memiliki penyelenggara aktif.", **kw)
-        elif len(aktif_ps) > 1:
-            add("PT-03", "Merah", uraian="PT memiliki lebih dari satu penyelenggara aktif.", **kw)
-        elif aktif_ps.iloc[0].id_yayasan != t.id_yayasan:
-            add("PT-03", "Merah", uraian=f"Penyelenggara aktif ({aktif_ps.iloc[0].id_yayasan}) berbeda dengan yayasan pada data PT ({t.id_yayasan}).", **kw)
-        for _, h in ps[ps.jenis_perpindahan.astype(str).str.contains("Alih kelola", na=False)].iterrows():
-            akt = pd.isna(h.tgl_akhir) or h.tgl_akhir > today
-            yid = h.id_yayasan_sebelumnya if not pd.isna(h.id_yayasan_sebelumnya) else t.id_yayasan
-            k2 = dict(kw, yid=yid, aktif=False)
-            if pd.isna(h.no_sk_alih_kelola):
-                add("PT-04", "Merah", uraian="Alih kelola tanpa nomor SK.", **k2)
-            elif str(h.alasan_alih_kelola) in ("Sengketa yayasan", "Tindak lanjut sanksi/pembinaan"):
-                add("PT-04", "Kuning", uraian=f"Alih kelola karena: {h.alasan_alih_kelola}.", **k2)
-        sg = sta_by_pt.get(t.kode_pt)
-        if sg is None:
-            add("PT-05", "Kuning", uraian="PT belum memiliki data statuta.", **kw)
-        else:
-            s = sg.iloc[-1]
-            if s.yayasan_berwenang_akademik == "Ya":
-                add("PT-06", "Kuning", uraian="Statuta memberi yayasan kewenangan akademik.", dasar=s.versi_statuta, **kw)
-            ds = [d for d in ad_dates.get(t.id_yayasan, []) if d > s.tgl_berlaku]
-            if ds:
-                add("PT-07", "Kuning", uraian=f"Statuta ({s.versi_statuta}) lebih lama dari perubahan AD yayasan "
-                    f"tanggal {max(ds):%d-%m-%Y}.", dasar=s.versi_statuta, **kw)
-        if t.status_pt == "Aktif":
-            pp = pim[(pim.kode_pt == t.kode_pt) & (pim.tgl_akhir.isna() | (pim.tgl_akhir > today))]
-            if len(pp) == 0:
-                add("PT-08", "Kuning", uraian="Tidak ada pimpinan PT yang sedang menjabat.", **kw)
+    df["jenis_flag"] = df["kode_pt"].apply(jenis_flag_pt)
+    df["flag_berat"] = df["jenis_flag"].apply(lambda s: sorted(s & FLAG_BERAT))
+    df["flag_ringan"] = df["jenis_flag"].apply(lambda s: sorted(s & FLAG_RINGAN))
 
-    # ---------- aturan yayasan ----------
-    for _, y in yy.iterrows():
-        kw = dict(level="Yayasan", yid=y.id_yayasan, kpt=None, ref=f"{y.id_yayasan} - {y.nama_yayasan}")
-        if y.status_yayasan != "Aktif":
-            add("YAY-01", "Kuning", uraian=f"Status yayasan: {y.status_yayasan}.", **kw)
-        og = organ[(organ.id_yayasan == y.id_yayasan) & (organ.tgl_akhir.isna() | (organ.tgl_akhir > today))]
-        n_ketua = (og.jabatan_yayasan == "Ketua Pengurus").sum()
-        if n_ketua > 1:
-            add("YAY-02", "Merah", uraian=f"Terdapat {n_ketua} Ketua Pengurus yang berjalan bersamaan.", **kw)
-        else:
-            hilang = [j for j in ("Pembina", "Ketua Pengurus", "Pengawas") if j not in set(og.jabatan_yayasan)]
-            if hilang:
-                add("YAY-02", "Kuning", uraian="Organ berjalan tidak lengkap: " + ", ".join(hilang) + ".", **kw)
-        ap = akta[(akta.id_yayasan == y.id_yayasan) & (akta.jenis_perubahan == "Pendirian")]
-        if len(ap) and str(ap.iloc[0].no_sk_kemenkum).strip() != str(y.no_sk_badan_hukum).strip():
-            add("YAY-03", "Kuning", uraian="No. SK badan hukum berbeda dengan SK pada akta pendirian.", **kw)
+    urutan = {"Hijau": 0, "Kuning": 1, "Merah": 2}
+    df["level_dasar"] = df["level"].astype(str)
 
-    cols = ["tingkat", "kode_aturan", "level", "id_yayasan", "kode_pt", "referensi", "uraian", "dasar", "aktif"]
-    fd = pd.DataFrame(F, columns=cols)
-    if not include_historis:
-        fd = fd[fd.aktif]
+    def putuskan(row):
+        dasar = urutan.get(row["level_dasar"], 0)
+        if row["flag_berat"]:
+            return 2, f"Flag berat: {', '.join(row['flag_berat'])}"
+        if len(row["flag_ringan"]) >= 2:
+            return 2, f"Akumulasi flag ringan: {', '.join(row['flag_ringan'])}"
+        if len(row["flag_ringan"]) == 1:
+            return max(dasar, 1), f"Flag ringan: {row['flag_ringan'][0]}"
+        return dasar, "-"
 
-    def agg(df, key, master, idcol, namecol, tipe):
-        out = []
-        for _, m in master.iterrows():
-            g = df[df[key] == m[idcol]]
-            nm, nk = (g.tingkat == "Merah").sum(), (g.tingkat == "Kuning").sum()
-            st = "Merah" if nm else "Kuning" if nk else "Hijau"
-            top = g.sort_values("tingkat", key=lambda c: c.map(RANK), ascending=False).head(1)
-            out.append(dict(tipe=tipe, id=m[idcol], nama=m[namecol], status=st, n_merah=int(nm), n_kuning=int(nk),
-                            alasan_utama=(top.iloc[0].kode_aturan + ": " + top.iloc[0].uraian) if len(top) else "Semua aturan lolos"))
-        return out
+    hasil = df.apply(putuskan, axis=1, result_type="expand")
+    df["level_rekomendasi"] = hasil[0].map({0: "Hijau", 1: "Kuning", 2: "Merah"})
+    df["alasan_naik_level"] = hasil[1].where(df["level_rekomendasi"] != df["level_dasar"], "-")
+    return df.drop(columns=["jenis_flag"])
 
-    st_y = pd.DataFrame(agg(fd, "id_yayasan", yy, "id_yayasan", "nama_yayasan", "Yayasan"))
-    st_p = pd.DataFrame(agg(fd, "kode_pt", pt, "kode_pt", "nama_pt", "PT"))
-    st_y = st_y.merge(yy[["id_yayasan", "kota", "provinsi"]], left_on="id", right_on="id_yayasan").drop(columns="id_yayasan")
-    st_p = st_p.merge(pt[["kode_pt", "id_yayasan", "jenis_pt"]], left_on="id", right_on="kode_pt").drop(columns="kode_pt")
-    return fd, st_y, st_p
+
+def semua_flag(s):
+    hasil = []
+    for nama, fn in [("F1/F2", hitung_f1_f2), ("F3", hitung_f3), ("F6", hitung_f6), ("F7", hitung_f7)]:
+        try:
+            df = fn(s)
+        except Exception:
+            df = pd.DataFrame()
+        if not df.empty:
+            df = df.assign(_kelompok=nama)
+            hasil.append(df)
+    return hasil
