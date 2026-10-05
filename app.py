@@ -6,6 +6,44 @@ import db
 import rules
 from schema import TABLES, ORDER, ENUMS, FKS
 
+st.set_page_config(page_title="EWS Yayasan & PT", page_icon="📌", layout="wide")
+db.init_db()
+
+# ---------------- Autentikasi / Login ----------------
+# Daftar akun pengguna (Username: Password)
+USER_CREDENTIALS = {
+    "admin": "admin123",
+    "user1": "password123",
+}
+
+if "logged_in" not in st.session_state:
+    st.session_state["logged_in"] = False
+if "username" not in st.session_state:
+    st.session_state["username"] = ""
+
+def login_screen():
+    st.title("🔒 Login Early Warning System")
+    st.subheader("Silakan masuk untuk mengakses Dashboard")
+    
+    with st.form("login_form"):
+        username = st.text_input("Nama Pengguna (Username)")
+        password = st.text_input("Kata Sandi (Password)", type="password")
+        submit = st.form_submit_button("Masuk / Login")
+        
+        if submit:
+            if username in USER_CREDENTIALS and USER_CREDENTIALS[username] == password:
+                st.session_state["logged_in"] = True
+                st.session_state["username"] = username
+                st.success("Login berhasil!")
+                st.rerun()
+            else:
+                st.error("Username atau password salah!")
+
+# Hentikan eksekusi halaman utama jika belum login
+if not st.session_state["logged_in"]:
+    login_screen()
+    st.stop()
+
 st.set_page_config(page_title="EWS Yayasan & PT", page_icon="🚦", layout="wide")
 db.init_db()
 EMO = {"Merah": "🔴", "Kuning": "🟡", "Hijau": "🟢"}
