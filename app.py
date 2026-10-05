@@ -361,8 +361,8 @@ elif page == "Unggah Excel":
 
 # ---------------- Log ----------------
 elif page == "Log & Riwayat Status":
-    st.title("Log perubahan data dan riwayat status")
-    t1, t2 = st.tabs(["Perubahan status (peringatan)", "Log audit data"])
+    st.title("Log perubahan data, riwayat status & data pengguna")
+    t1, t2, t3 = st.tabs(["Perubahan status (peringatan)", "Log audit data", "👥 Data Pengguna Terdaftar"])
     with t1:
         h = db.read_log("riwayat_status")
         if len(h):
