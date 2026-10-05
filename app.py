@@ -1,5 +1,7 @@
 """Dashboard Early Warning System Yayasan & Perguruan Tinggi (Streamlit)."""
 import io
+import sqlite3
+import hashlib
 import pandas as pd
 import streamlit as st
 import db
@@ -9,39 +11,114 @@ from schema import TABLES, ORDER, ENUMS, FKS
 st.set_page_config(page_title="EWS Yayasan & PT", page_icon="📌", layout="wide")
 db.init_db()
 
-# ---------------- Autentikasi / Login ----------------
-# Daftar akun pengguna (Username: Password)
-USER_CREDENTIALS = {
-    "admin": "admin123",
-    "user1": "password123",
-}
+# ---------------- Manajemen User & Database SQLite ----------------
+DB_FILE = "ews.db"  # Menggunakan database SQLite yang sama
 
+def init_user_db():
+    """Membuat tabel users jika belum ada."""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS users (
+            username TEXT PRIMARY KEY,
+            password TEXT NOT NULL,
+            nama_lengkap TEXT
+        )
+    ''')
+    conn.commit()
+    conn.close()
+
+def hash_password(password: str) -> str:
+    """Mengubah password menjadi hash SHA-256 demi keamanan."""
+    return hashlib.sha256(password.encode("utf-8")).hexdigest()
+
+def register_user(username, password, nama_lengkap=""):
+    """Menambahkan user baru ke database."""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    try:
+        c.execute("INSERT INTO users (username, password, nama_lengkap) VALUES (?, ?, ?)",
+                  (username.strip(), hash_password(password), nama_lengkap.strip()))
+        conn.commit()
+        return True, "Akun berhasil dibuat! Silakan pindah ke tab Masuk."
+    except sqlite3.IntegrityError:
+        return False, "Username sudah terdaftar! Pilih username lain."
+    finally:
+        conn.close()
+
+def authenticate_user(username, password):
+    """Mengecek apakah username dan password cocok."""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("SELECT username, nama_lengkap FROM users WHERE username = ? AND password = ?",
+              (username.strip(), hash_password(password)))
+    user_data = c.fetchone()
+    conn.close()
+    return user_data
+
+# Inisialisasi tabel user saat aplikasi berjalan
+init_user_db()
+
+# ---------------- Sesi Login Streamlit ----------------
 if "logged_in" not in st.session_state:
     st.session_state["logged_in"] = False
 if "username" not in st.session_state:
     st.session_state["username"] = ""
 
-def login_screen():
-    st.title("🔒 Login Early Warning System")
-    st.subheader("Silakan masuk untuk mengakses Dashboard")
+def auth_screen():
+    st.title("🔒 Akses Early Warning System")
+    st.caption("Silakan Masuk dengan akun Anda atau Daftar akun baru.")
     
-    with st.form("login_form"):
-        username = st.text_input("Nama Pengguna (Username)")
-        password = st.text_input("Kata Sandi (Password)", type="password")
-        submit = st.form_submit_button("Masuk / Login")
-        
-        if submit:
-            if username in USER_CREDENTIALS and USER_CREDENTIALS[username] == password:
-                st.session_state["logged_in"] = True
-                st.session_state["username"] = username
-                st.success("Login berhasil!")
-                st.rerun()
-            else:
-                st.error("Username atau password salah!")
+    tab_login, tab_register = st.tabs(["🔑 Masuk (Login)", "📝 Daftar Akun Baru"])
+    
+    # ---------------- TAB 1: MASUK / LOGIN ----------------
+    with tab_login:
+        with st.form("form_login"):
+            username = st.text_input("Username")
+            password = st.text_input("Password", type="password")
+            btn_login = st.form_submit_button("Masuk", type="primary")
+            
+            if btn_login:
+                if not username or not password:
+                    st.warning("Mohon isi username dan password.")
+                else:
+                    user_data = authenticate_user(username, password)
+                    if user_data:
+                        st.session_state["logged_in"] = True
+                        st.session_state["username"] = user_data[0]
+                        st.success("Login berhasil!")
+                        st.rerun()
+                    else:
+                        st.error("Username atau password salah!")
 
-# Hentikan eksekusi halaman utama jika belum login
+    # ---------------- TAB 2: DAFTAR / REGISTER ----------------
+    with tab_register:
+        with st.form("form_register"):
+            reg_fullname = st.text_input("Nama Lengkap")
+            reg_username = st.text_input("Username Baru (tanpa spasi)")
+            reg_password = st.text_input("Password Baru", type="password")
+            reg_password_confirm = st.text_input("Konfirmasi Password Baru", type="password")
+            btn_register = st.form_submit_button("Daftar Akun")
+            
+            if btn_register:
+                if not reg_username or not reg_password:
+                    st.warning("Username dan Password tidak boleh kosong.")
+                elif " " in reg_username:
+                    st.warning("Username tidak boleh mengandung spasi.")
+                elif len(reg_password) < 6:
+                    st.warning("Password minimal 6 karakter.")
+                elif reg_password != reg_password_confirm:
+                    st.error("Konfirmasi password tidak cocok!")
+                else:
+                    success, msg = register_user(reg_username, reg_password, reg_fullname)
+                    if success:
+                        st.success(msg)
+                    else:
+                        st.error(msg)
+
+# Hentikan eksekusi jika pengguna belum login
 if not st.session_state["logged_in"]:
-    login_screen()
+    auth_screen()
     st.stop()
 
 st.set_page_config(page_title="EWS Yayasan & PT", page_icon="🚦", layout="wide")
