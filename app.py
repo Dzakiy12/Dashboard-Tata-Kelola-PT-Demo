@@ -1,278 +1,344 @@
-"""Dashboard Early Warning System Yayasan & Perguruan Tinggi (Streamlit)."""
-import io
+"""Dashboard peringatan dini tata kelola yayasan-PT (contoh/prototipe).
+
+Jalankan:
+    pip install streamlit pandas rapidfuzz openpyxl plotly
+    streamlit run app_dashboard.py
+
+Sumber data (urutan prioritas):
+1. Database, bila DB_URL diisi (lihat fungsi ambil_url). Perlu: pip install sqlalchemy
+2. Unggah template Excel master (sheet: yayasan, pt, organ_yayasan, pimpinan_pt, aturan_statuta, dst.)
+3. Data contoh fiktif bawaan (buat_sample.py), agar dashboard tetap bisa dicoba tanpa data.
+
+Perhitungan flag (F) dan indikator risiko (R) ada di indikator.py -- pisahkan logika dari tampilan
+supaya mudah diuji dan diperluas.
+"""
+import hashlib
+import os
+from pathlib import Path
+
 import pandas as pd
+import plotly.express as px
 import streamlit as st
-import db
-import rules
-from schema import TABLES, ORDER, ENUMS, FKS
 
-st.set_page_config(page_title="EWS Yayasan & PT", page_icon="🚦", layout="wide")
-db.init_db()
-EMO = {"Merah": "🔴", "Kuning": "🟡", "Hijau": "🟢"}
-st.session_state.setdefault("ver", 0)
+from indikator import (buang_contoh, gabungkan_level_dengan_flag, hitung_risiko_per_pt, semua_flag,
+                       skor_komposit)
 
-# ---------------- sidebar ----------------
-st.sidebar.title("🚦 EWS Yayasan & PT")
-page = st.sidebar.radio("Menu", ["Ringkasan", "Detail Yayasan", "Kelola Data", "Unggah Excel", "Log & Riwayat Status", "Aturan"])
-user = st.sidebar.text_input("Nama pengguna (wajib untuk mengubah data)", key="user")
-historis = st.sidebar.toggle("Hitung temuan historis", value=False,
-                             help="Mati: status hanya dari pimpinan yang sedang menjabat dan kondisi saat ini. Hidup: semua riwayat ikut dihitung.")
-st.sidebar.caption("Prototipe. Aturan perlu divalidasi ahli hukum. Tambahkan autentikasi sebelum dipakai bersama.")
-
-data = db.load_all()
-cfg = rules.load_cfg()
-findings, st_y, st_p = rules.evaluate(data, cfg, include_historis=historis)
+st.set_page_config(page_title="Peringatan Dini Tata Kelola Yayasan-PT", layout="wide")
+STATUS_FILE = Path("status_temuan.csv")
+STATUS_OPSI = ["Belum ditinjau", "Sedang diverifikasi", "Terbukti", "Tidak terbukti"]
+WARNA = {"Hijau": "#2e7d32", "Kuning": "#b58900", "Merah": "#c62828"}
 
 
-def after_save(pemicu):
-    """Evaluasi ulang setelah perubahan, catat perubahan status."""
-    d = db.load_all()
-    _, sy, sp = rules.evaluate(d, rules.load_cfg(), include_historis=historis)
-    ch = db.record_status(pd.concat([sy, sp]), pemicu)
-    st.session_state["ver"] += 1
-    return ch
+# ---------- Login sederhana (username/password) ----------
+# CATATAN KEAMANAN: ini login dasar untuk tim kecil/demo, BUKAN pengganti SSO instansi.
+# Untuk data asli, sambungkan ke sistem identitas resmi kementerian (SSO/VPN) -- tanyakan ke tim TI.
+# Akun diatur lewat st.secrets["users"], format: {"username": "hash_sha256_dari_password", ...}.
+# Buat hash-nya dengan: python -c "import hashlib; print(hashlib.sha256(b'password_anda').hexdigest())"
+def _hash(teks):
+    return hashlib.sha256(teks.encode()).hexdigest()
 
 
-def show_changes(ch):
-    if ch is not None and len(ch):
-        st.warning(f"{len(ch)} entitas berubah status akibat pembaruan ini:")
-        ch = ch.assign(dari=ch.dari.map(lambda x: EMO.get(x, "") + " " + x), ke=ch.ke.map(lambda x: EMO.get(x, "") + " " + x))
-        st.dataframe(ch[["tipe", "id_entitas", "nama", "dari", "ke"]], hide_index=True, width="stretch")
+def ambil_users():
+    try:
+        return dict(st.secrets["users"]), True
+    except Exception:
+        # Akun demo bawaan HANYA jika st.secrets["users"] belum diatur -- jangan dipakai untuk data asli.
+        return {"demo": _hash("demo123")}, False
 
 
-def with_emoji(df):
-    df = df.copy()
-    df["status"] = df["status"].map(lambda s: f"{EMO[s]} {s}")
-    return df
-
-
-# ---------------- Ringkasan ----------------
-if page == "Ringkasan":
-    st.title("Ringkasan Early Warning System")
-    c = st.columns(6)
-    for i, (lab, df) in enumerate([("Yayasan", st_y), ("Perguruan Tinggi", st_p)]):
-        vc = df.status.value_counts()
-        for j, s in enumerate(["Merah", "Kuning", "Hijau"]):
-            c[i * 3 + j].metric(f"{EMO[s]} {lab}", int(vc.get(s, 0)))
-    tab_y, tab_p, tab_f = st.tabs(["Yayasan", "Perguruan Tinggi", "Semua temuan"])
-    with tab_y:
-        f1, f2, f3 = st.columns(3)
-        sel = f1.multiselect("Status", ["Merah", "Kuning", "Hijau"], default=["Merah", "Kuning", "Hijau"], key="fy")
-        prov = f2.multiselect("Provinsi", sorted(st_y.provinsi.unique()), key="fp")
-        q = f3.text_input("Cari nama/ID", key="fq")
-        v = st_y[st_y.status.isin(sel)]
-        if prov:
-            v = v[v.provinsi.isin(prov)]
-        if q:
-            v = v[v.nama.str.contains(q, case=False) | v.id.str.contains(q, case=False)]
-        v = v.sort_values("status", key=lambda s: s.map(rules.RANK), ascending=False)
-        st.dataframe(with_emoji(v)[["status", "id", "nama", "kota", "provinsi", "n_merah", "n_kuning", "alasan_utama"]],
-                     hide_index=True, width="stretch")
-    with tab_p:
-        sel = st.multiselect("Status", ["Merah", "Kuning", "Hijau"], default=["Merah", "Kuning", "Hijau"], key="fpt")
-        v = st_p[st_p.status.isin(sel)].sort_values("status", key=lambda s: s.map(rules.RANK), ascending=False)
-        st.dataframe(with_emoji(v)[["status", "id", "nama", "jenis_pt", "id_yayasan", "n_merah", "n_kuning", "alasan_utama"]],
-                     hide_index=True, width="stretch")
-    with tab_f:
-        tf = st.multiselect("Tingkat", ["Merah", "Kuning"], default=["Merah", "Kuning"], key="ftf")
-        rl = st.multiselect("Kode aturan", sorted(findings.kode_aturan.unique()), key="frl")
-        v = findings[findings.tingkat.isin(tf)]
-        if rl:
-            v = v[v.kode_aturan.isin(rl)]
-        st.caption(f"{len(v)} temuan")
-        st.dataframe(v.assign(tingkat=v.tingkat.map(lambda s: f"{EMO[s]} {s}"))
-                     [["tingkat", "kode_aturan", "id_yayasan", "referensi", "uraian", "dasar", "aktif"]],
-                     hide_index=True, width="stretch")
-        st.download_button("Unduh temuan (CSV)", v.to_csv(index=False).encode("utf-8-sig"), "temuan_ews.csv", "text/csv")
-
-# ---------------- Detail Yayasan ----------------
-elif page == "Detail Yayasan":
-    st.title("Detail Yayasan")
-    opts = dict(zip(st_y.id, st_y.id + " - " + st_y.nama))
-    yid = st.selectbox("Pilih yayasan", list(opts), format_func=opts.get)
-    row = st_y[st_y.id == yid].iloc[0]
-    st.subheader(f"{EMO[row.status]} {row.status} - {row.nama}")
-    st.caption(f"{row.kota}, {row.provinsi}")
-    fy = findings[findings.id_yayasan == yid]
-    if len(fy):
-        st.dataframe(fy.assign(tingkat=fy.tingkat.map(lambda s: f"{EMO[s]} {s}"))
-                     [["tingkat", "kode_aturan", "level", "referensi", "uraian", "dasar", "aktif"]],
-                     hide_index=True, width="stretch")
-    else:
-        st.success("Tidak ada temuan. Semua aturan lolos.")
-    st.markdown("**Perguruan tinggi di bawah yayasan ini**")
-    sp = st_p[st_p.id_yayasan == yid]
-    st.dataframe(with_emoji(sp)[["status", "id", "nama", "jenis_pt", "alasan_utama"]], hide_index=True, width="stretch")
-    with st.expander("Akta"):
-        st.dataframe(data["akta"][data["akta"].id_yayasan == yid], hide_index=True, width="stretch")
-    with st.expander("Organ yayasan"):
-        st.dataframe(data["organ_yayasan"][data["organ_yayasan"].id_yayasan == yid], hide_index=True, width="stretch")
-    with st.expander("Pimpinan PT"):
-        st.dataframe(data["pimpinan_pt"][data["pimpinan_pt"].id_yayasan == yid], hide_index=True, width="stretch")
-    st.info("Untuk mengubah data, buka menu **Kelola Data** dan pilih yayasan ini pada filter.")
-
-# ---------------- Kelola Data ----------------
-elif page == "Kelola Data":
-    st.title("Kelola Data")
-    st.caption("Ubah sel langsung, tambah baris di bagian bawah tabel, atau hapus baris (pilih lalu tekan Delete). "
-               "Kosongkan kolom ID pada baris baru agar ID dibuat otomatis. Status dihitung ulang setelah disimpan.")
-    c1, c2 = st.columns([2, 2])
-    tname = c1.selectbox("Tabel", ORDER, format_func=lambda t: TABLES[t]["label"])
-    yopts = {"(semua yayasan)": None} | dict(zip(st_y.nama, st_y.id))
-    ylab = c2.selectbox("Filter yayasan", list(yopts))
-    yid = yopts[ylab]
-    meta, full = TABLES[tname], data[tname]
-    pks = meta["pk"]
-    view = full
-    if yid:
-        pt_codes = set(data["pt"][data["pt"].id_yayasan == yid].kode_pt) | \
-            set(data["riwayat_penyelenggara"][data["riwayat_penyelenggara"].id_yayasan == yid].kode_pt)
-        if tname == "yayasan":
-            view = full[full.id_yayasan == yid]
-        elif "id_yayasan" in full.columns:
-            view = full[full.id_yayasan == yid]
-        elif "kode_pt" in full.columns:
-            view = full[full.kode_pt.isin(pt_codes)]
-        elif tname == "riwayat_perubahan":
-            view = full[full.id_entitas.isin(pt_codes | {yid})]
-    view = view.reset_index(drop=True)
-
-    cc = {}
-    for col in view.columns:
-        if col in meta["dates"]:
-            cc[col] = st.column_config.DateColumn(col, format="YYYY-MM-DD")
-        elif col in meta["ints"]:
-            cc[col] = st.column_config.NumberColumn(col, step=1)
-        elif col in ENUMS:
-            cc[col] = st.column_config.SelectboxColumn(col, options=ENUMS[col])
-        elif col in FKS.get(tname, {}):
-            parent = FKS[tname][col]
-            cc[col] = st.column_config.SelectboxColumn(col, options=list(data[parent][TABLES[parent]["pk"]]))
-    cc[pks] = st.column_config.TextColumn(pks, help="Kosongkan pada baris baru untuk ID otomatis")
-
-    st.write(f"{len(view)} baris")
-    edited = st.data_editor(view, num_rows="dynamic", column_config=cc, width="stretch", hide_index=True,
-                            key=f"ed_{tname}_{yid}_{st.session_state['ver']}")
-    if st.button("💾 Simpan perubahan", type="primary"):
-        if not user.strip():
-            st.error("Isi nama pengguna di sidebar terlebih dahulu.")
-        else:
-            new = db.fill_ids(tname, edited.reset_index(drop=True), full)
-            old_keys = {db.norm(k) for k in view[pks]}
-            new_keys = {db.norm(k) for k in new[pks]}
-            deleted = old_keys - new_keys
-            others = full[~full[pks].map(db.norm).isin(old_keys)]
-            # ID baru tidak boleh bentrok dengan baris di luar filter
-            clash = new_keys & set(others[pks].map(db.norm))
-            state = dict(data)
-            state[tname] = pd.concat([others, new], ignore_index=True)
-            errs = db.validate(tname, new, state, deleted)
-            if clash:
-                errs.append(f"ID sudah dipakai di luar filter: {', '.join(sorted(map(str, clash)))}")
-            if errs:
-                st.error("Perubahan tidak disimpan:\n\n" + "\n\n".join("- " + e for e in errs))
+def cek_login():
+    if st.session_state.get("login_ok"):
+        return True
+    users, dari_secrets = ambil_users()
+    _, tengah, _ = st.columns([1, 1.2, 1])
+    with tengah:
+        st.title("Masuk")
+        if not dari_secrets:
+            st.info("Akun belum diatur lewat secrets (`st.secrets['users']`). Memakai akun demo bawaan: "
+                    "**demo** / **demo123**. Jangan dipakai untuk data asli -- lihat catatan di app_dashboard.py.")
+        with st.form("form_login"):
+            u = st.text_input("Username")
+            p = st.text_input("Password", type="password")
+            masuk = st.form_submit_button("Masuk", width="stretch")
+        if masuk:
+            if u in users and users[u] == _hash(p):
+                st.session_state["login_ok"] = True
+                st.session_state["user"] = u
+                st.rerun()
             else:
-                a, u, h = db.apply_changes(tname, view, new, user.strip())
-                if a + u + h == 0:
-                    st.info("Tidak ada perubahan.")
-                else:
-                    ch = after_save(f"{tname}: +{a} ~{u} -{h} oleh {user.strip()}")
-                    st.success(f"Tersimpan: {a} ditambah, {u} diubah, {h} dihapus.")
-                    show_changes(ch)
-                    st.button("Muat ulang tabel")
+                st.error("Username atau password salah.")
+    return False
 
-# ---------------- Unggah Excel ----------------
-elif page == "Unggah Excel":
-    st.title("Unggah Excel (tambah / perbarui massal)")
-    st.caption("Gunakan format yang sama dengan file contoh (nama sheet = nama tabel). Baris dengan ID yang sudah ada akan "
-               "diperbarui, ID baru ditambahkan. Tidak ada baris yang dihapus. Semua perubahan dicatat di log.")
-    buf = io.BytesIO()
-    with pd.ExcelWriter(buf) as w:
-        for t in ORDER:
-            data[t].to_excel(w, sheet_name=t, index=False)
-    st.download_button("Unduh data saat ini (Excel)", buf.getvalue(), "data_ews_saat_ini.xlsx")
-    up = st.file_uploader("File .xlsx", type=["xlsx"])
-    if up:
-        sheets = pd.read_excel(up, sheet_name=None)
-        state, plan, errs = dict(data), {}, []
-        for t in ORDER:
-            if t not in sheets:
-                continue
-            raw = sheets[t]
-            miss = [c for c in data[t].columns if c not in raw.columns and c == TABLES[t]["pk"]]
-            if miss:
-                errs.append(f"[{t}] kolom kunci {miss[0]} tidak ada.")
-                continue
-            up_df = db._clean(t, raw)
-            for c in data[t].columns:
-                if c not in up_df.columns:
-                    up_df[c] = None
-            up_df = up_df[list(data[t].columns)]
-            up_df = db.fill_ids(t, up_df, state[t])
-            pkn = TABLES[t]["pk"]
-            keep = state[t][~state[t][pkn].map(db.norm).isin(set(up_df[pkn].map(db.norm)))]
-            merged = pd.concat([keep, up_df], ignore_index=True)
-            errs += db.validate(t, up_df, {**state, t: merged})
-            plan[t] = (data[t], merged)
-            state[t] = merged
-        if errs:
-            st.error("Unggahan ditolak:\n\n" + "\n\n".join("- " + e for e in errs[:30]))
-        elif not plan:
-            st.warning("Tidak ada sheet yang namanya cocok dengan tabel.")
-        else:
-            rows = []
-            for t, (old, new) in plan.items():
-                ok = {db.norm(r[TABLES[t]["pk"]]): {c: db.norm(r[c]) for c in old.columns} for _, r in old.iterrows()}
-                a = u = 0
-                for _, r in new.iterrows():
-                    k = db.norm(r[TABLES[t]["pk"]])
-                    if k not in ok:
-                        a += 1
-                    elif any(str(db.norm(r[c])) != str(ok[k][c]) for c in old.columns):
-                        u += 1
-                rows.append(dict(tabel=t, ditambah=a, diubah=u))
-            st.dataframe(pd.DataFrame(rows), hide_index=True)
-            if st.button("Terapkan", type="primary"):
-                if not user.strip():
-                    st.error("Isi nama pengguna di sidebar terlebih dahulu.")
-                else:
-                    tot = 0
-                    for t, (old, new) in plan.items():
-                        a, u, _ = db.apply_changes(t, old, new, user.strip(), allow_delete=False)
-                        tot += a + u
-                    ch = after_save(f"unggah Excel ({tot} baris) oleh {user.strip()}")
-                    st.success(f"Selesai: {tot} baris ditambah/diperbarui.")
-                    show_changes(ch)
 
-# ---------------- Log ----------------
-elif page == "Log & Riwayat Status":
-    st.title("Log perubahan data dan riwayat status")
-    t1, t2 = st.tabs(["Perubahan status (peringatan)", "Log audit data"])
-    with t1:
-        h = db.read_log("riwayat_status")
-        if len(h):
-            h = h.assign(dari=h.dari.map(lambda x: EMO.get(x, "") + " " + x), ke=h.ke.map(lambda x: EMO.get(x, "") + " " + x))
-            st.dataframe(h.drop(columns="id"), hide_index=True, width="stretch")
-        else:
-            st.info("Belum ada perubahan status. Akan tercatat setelah data diperbarui.")
-    with t2:
-        a = db.read_log("audit_log")
-        st.dataframe(a.drop(columns="id"), hide_index=True, width="stretch") if len(a) else st.info("Belum ada perubahan data.")
+if not cek_login():
+    st.stop()
 
-# ---------------- Aturan ----------------
+st.sidebar.success(f"Masuk sebagai: **{st.session_state.get('user','')}**")
+if st.sidebar.button("Keluar"):
+    st.session_state.clear()
+    st.rerun()
+st.sidebar.divider()
+
+
+# ---------- Sumber data ----------
+def ambil_url():
+    if os.environ.get("DB_URL"):
+        return os.environ["DB_URL"]
+    try:
+        return st.secrets["db_url"]
+    except Exception:
+        return None
+
+
+@st.cache_data(ttl=600)
+def muat_excel(file):
+    s = pd.read_excel(file, sheet_name=None, skiprows=[1] if file is not None else None)
+    return buang_contoh(s)
+
+
+@st.cache_resource
+def buat_engine(url):
+    from sqlalchemy import create_engine
+    return create_engine(url, pool_pre_ping=True)
+
+
+@st.cache_data(ttl=600)
+def muat_db(_engine):
+    from sqlalchemy import text
+    tabel = ["yayasan", "pt", "riwayat_penyelenggara", "akta", "organ_yayasan", "pimpinan_pt",
+             "aturan_statuta", "riwayat_perubahan"]
+    s = {}
+    for t in tabel:
+        try:
+            s[t] = pd.read_sql(text(f"SELECT * FROM {t}"), _engine)
+        except Exception:
+            s[t] = pd.DataFrame()
+    return buang_contoh(s)
+
+
+@st.cache_data
+def muat_contoh():
+    import sys
+    sys.path.insert(0, str(Path(__file__).parent))
+    from buat_sample import SHEETS
+    return SHEETS
+
+
+def tgl(t):
+    if pd.isna(t):
+        return "-"
+    return "sekarang" if pd.Timestamp(t) >= pd.Timestamp("2099-01-01") else pd.Timestamp(t).strftime("%Y-%m-%d")
+
+
+# ---------- Status tinjauan pakar (database bila DB_URL ada; kalau tidak, CSV lokal hanya untuk demo) ----------
+def siapkan_tabel_status(engine):
+    from sqlalchemy import inspect, text
+    if not inspect(engine).has_table("status_temuan"):
+        with engine.begin() as k:
+            k.execute(text(
+                "CREATE TABLE status_temuan (id_temuan VARCHAR(100) PRIMARY KEY, status VARCHAR(30), "
+                "catatan TEXT, pemeriksa VARCHAR(100), waktu VARCHAR(20))"))
+
+
+def baca_status(engine=None):
+    if engine is not None:
+        from sqlalchemy import text
+        siapkan_tabel_status(engine)
+        df = pd.read_sql(text("SELECT * FROM status_temuan"), engine).fillna("").astype(str)
+        return df.set_index("id_temuan")
+    if STATUS_FILE.exists():
+        return pd.read_csv(STATUS_FILE, dtype=str).fillna("").set_index("id_temuan")
+    return pd.DataFrame(columns=["status", "catatan", "pemeriksa", "waktu"]).rename_axis("id_temuan")
+
+
+def simpan_status(id_temuan, status, catatan, pemeriksa, engine=None):
+    waktu = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M")
+    if engine is not None:
+        from sqlalchemy import text
+        siapkan_tabel_status(engine)
+        with engine.begin() as k:  # hapus lalu isi ulang: portabel di PostgreSQL/MySQL/SQLite
+            k.execute(text("DELETE FROM status_temuan WHERE id_temuan = :i"), {"i": id_temuan})
+            k.execute(text("INSERT INTO status_temuan (id_temuan, status, catatan, pemeriksa, waktu) "
+                           "VALUES (:i, :s, :c, :p, :w)"),
+                      {"i": id_temuan, "s": status, "c": catatan, "p": pemeriksa, "w": waktu})
+        return
+    df = baca_status()
+    df.loc[id_temuan] = [status, catatan, pemeriksa, waktu]
+    df.to_csv(STATUS_FILE)
+
+
+# ---------- Sidebar: pilih sumber data ----------
+st.sidebar.header("Data")
+url = ambil_url()
+sumber = None
+engine = None
+if url:
+    engine = buat_engine(url)
+    data = muat_db(engine)
+    sumber = "database"
 else:
-    st.title("Aturan dan parameter")
-    st.caption("Aturan di bawah adalah usulan awal berdasarkan kolom data. Validasi dengan ahli hukum sebelum dipakai.")
-    rdf = pd.DataFrame([dict(kode=k, aktif=cfg["aktif"].get(k, True), nama=v[0], uraian=v[1]) for k, v in rules.RULES.items()])
-    ed = st.data_editor(rdf, hide_index=True, width="stretch", disabled=["kode", "nama", "uraian"], key="rules_ed")
-    p = cfg["parameter"]
-    c = st.columns(3)
-    p["toleransi_hari_masa_jabatan"] = c[0].number_input("Toleransi masa jabatan (hari)", 0, 365, int(p["toleransi_hari_masa_jabatan"]))
-    p["batas_bulan_plt_pj"] = c[1].number_input("Batas Plt/Pj (bulan)", 1, 36, int(p["batas_bulan_plt_pj"]))
-    p["jendela_bulan_pasca_perubahan_ad"] = c[2].number_input("Jendela pasca perubahan AD (bulan)", 1, 60, int(p["jendela_bulan_pasca_perubahan_ad"]))
-    if st.button("Simpan aturan", type="primary"):
-        cfg["aktif"] = {r.kode: bool(r.aktif) for r in ed.itertuples()}
-        rules.save_cfg(cfg)
-        ch = after_save("perubahan konfigurasi aturan")
-        st.success("Tersimpan.")
-        show_changes(ch)
+    unggah = st.sidebar.file_uploader("Unggah template Excel (opsional)", type="xlsx")
+    if unggah:
+        data = muat_excel(unggah)
+        sumber = "unggahan"
+    else:
+        data = muat_contoh()
+        sumber = "contoh"
+
+if sumber == "contoh":
+    st.sidebar.info("Memakai **data contoh fiktif**. Unggah template Excel untuk memakai data asli.")
+else:
+    st.sidebar.success(f"Sumber data: {sumber}")
+
+wilayah_semua = sorted(data.get("pt", pd.DataFrame()).get("wilayah_lldikti", pd.Series(dtype=str)).dropna().unique())
+wilayah_pilih = st.sidebar.multiselect("Filter wilayah LLDikti", wilayah_semua, default=wilayah_semua)
+
+# ---------- Hitung indikator ----------
+risiko = hitung_risiko_per_pt(data)
+flag_frames = semua_flag(data)
+if not risiko.empty:
+    risiko = skor_komposit(risiko)
+    risiko = gabungkan_level_dengan_flag(risiko, flag_frames)
+flag_semua = pd.concat(flag_frames, ignore_index=True) if flag_frames else pd.DataFrame()
+
+if wilayah_pilih and not risiko.empty:
+    risiko_v = risiko[risiko["wilayah_lldikti"].isin(wilayah_pilih)]
+    kode_terpilih = set(risiko_v["kode_pt"])
+    flag_v = flag_semua[flag_semua["kode_pt"].isin(kode_terpilih)] if not flag_semua.empty else flag_semua
+else:
+    risiko_v, flag_v = risiko, flag_semua
+
+status_df = baca_status(engine)
+if not flag_v.empty:
+    flag_v = flag_v.copy()
+    flag_v["status"] = flag_v["id_temuan"].map(status_df["status"]).fillna("Belum ditinjau")
+
+# ==================== HALAMAN ====================
+halaman = st.sidebar.radio("Halaman", ["Ringkasan", "Detail temuan"])
+st.sidebar.caption("Ambang level risiko dan bobot indikator di sini adalah usulan awal ilustratif, "
+                   "belum disepakati pakar kelembagaan. Jangan dipakai sebagai dasar keputusan final.")
+
+if halaman == "Ringkasan":
+    st.title("Ringkasan tata kelola yayasan-PT")
+    if risiko_v.empty:
+        st.warning("Data pt/pimpinan_pt/aturan_statuta belum cukup untuk menghitung indikator.")
+        st.stop()
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Total PT", len(risiko_v))
+    c2.metric("Level merah", int((risiko_v["level_rekomendasi"] == "Merah").sum()))
+    c3.metric("Level kuning", int((risiko_v["level_rekomendasi"] == "Kuning").sum()))
+    c4.metric("Flag pelanggaran", len(flag_v))
+    st.caption("Level rekomendasi = skor risiko DITIMPA flag pelanggaran: F2/F4/F6 (berat) sendirian sudah "
+              "Merah; F1/F3/F5/F7 (ringan) satu jenis jadi Kuning, dua jenis atau lebih jadi Merah.")
+
+    col1, col2 = st.columns([1, 1])
+    with col1:
+        st.subheader("Sebaran level risiko (rekomendasi)")
+        agg = risiko_v["level_rekomendasi"].value_counts().reindex(["Hijau", "Kuning", "Merah"]).fillna(0).reset_index()
+        agg.columns = ["level", "jumlah"]
+        fig = px.bar(agg, x="level", y="jumlah", color="level",
+                     color_discrete_map=WARNA, text="jumlah")
+        fig.update_layout(showlegend=False, height=320)
+        st.plotly_chart(fig, width="stretch")
+    with col2:
+        st.subheader("Flag pelanggaran per jenis")
+        if flag_v.empty:
+            st.info("Tidak ada flag pelanggaran pada data/filter saat ini.")
+        else:
+            agg2 = flag_v["_kelompok"].value_counts().reset_index()
+            agg2.columns = ["jenis", "jumlah"]
+            fig2 = px.bar(agg2, x="jenis", y="jumlah", text="jumlah")
+            fig2.update_layout(height=320)
+            st.plotly_chart(fig2, width="stretch")
+
+    st.subheader("Daftar prioritas")
+    urutan_level = {"Merah": 0, "Kuning": 1, "Hijau": 2}
+    tampil = risiko_v.assign(_u=risiko_v["level_rekomendasi"].map(urutan_level)).sort_values(
+        ["_u", "skor_risiko"], ascending=[True, False])[
+        ["nama_pt", "nama_yayasan", "wilayah_lldikti", "level_rekomendasi", "skor_risiko", "alasan_naik_level"]
+    ].rename(columns={"nama_pt": "PT", "nama_yayasan": "Yayasan", "wilayah_lldikti": "Wilayah",
+                      "level_rekomendasi": "Level", "skor_risiko": "Skor R", "alasan_naik_level": "Alasan flag"})
+    st.dataframe(tampil, hide_index=True, width="stretch", height=320)
+
+    if not flag_v.empty:
+        st.subheader("Ringkasan flag pelanggaran")
+        ringkas_flag = flag_v.groupby(["_kelompok", "nama_pt"]).size().reset_index(name="jumlah")
+        st.dataframe(ringkas_flag.rename(columns={"_kelompok": "Jenis flag", "nama_pt": "PT", "jumlah": "Jumlah"}),
+                    hide_index=True, width="stretch")
+
+    st.caption("Skor risiko = rata-rata indikator R1-R13 yang ternormalisasi (0-1), bobot sama rata. "
+              "Data pengaduan/kasus konflik belum tersedia di sheet ini sehingga sebagian indikator (R2, R16) "
+              "hanya sebagian terhitung atau ditandai kosong.")
+
+else:
+    st.title("Detail temuan")
+    if flag_v.empty:
+        st.success("Tidak ada temuan flag pelanggaran pada data/filter saat ini.")
+        st.stop()
+
+    pilih_status = st.sidebar.multiselect("Status tinjauan", STATUS_OPSI, default=STATUS_OPSI)
+    view = flag_v[flag_v["status"].isin(pilih_status)]
+    if view.empty:
+        st.info("Tidak ada temuan dengan status yang dipilih.")
+        st.stop()
+
+    idx = st.selectbox("Pilih temuan", view.index,
+                       format_func=lambda i: f"{view.at[i,'id_temuan']} | {view.at[i,'nama_pt']}")
+    r = flag_v.loc[idx]
+    kel = r["_kelompok"]
+
+    kiri, kanan = st.columns([4, 1])
+    kiri.subheader(r["nama_pt"])
+    kiri.caption(f"{r.get('nama_yayasan','')} · {r['id_temuan']}")
+    kanan.markdown(f":red[**Flag: {kel}**]")
+
+    if kel == "F1/F2":
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Keyakinan", r["keyakinan"].split(" (")[0])
+        c2.metric("Irisan mulai", tgl(r["irisan_mulai"]))
+        c3.metric("Lama irisan", f"{r['lama_bulan']} bulan")
+        c4.metric("Status", r["status"])
+        st.markdown("#### Bukti")
+        bukti = pd.DataFrame([
+            {"Sisi": "Yayasan", "Nama": r["nama_lengkap_org"], "Jabatan": r["jabatan_yayasan"],
+             "Mulai": tgl(r["tgl_mulai_org"]), "Akhir": tgl(r["tgl_akhir_org"])},
+            {"Sisi": "Perguruan tinggi", "Nama": r["nama_lengkap_pim"],
+             "Jabatan": f"{r['jabatan_pt']} ({r['status_definitif']})",
+             "Mulai": tgl(r["tgl_mulai_pim"]), "Akhir": tgl(r["tgl_akhir_pim"])},
+        ])
+        st.dataframe(bukti, hide_index=True, width="stretch")
+        if r.get("f2"):
+            st.error(f"{r.get('versi_statuta','-')}, {r.get('pasal_pengangkatan','-')}: "
+                    "statuta melarang rangkap dengan organ yayasan (F2).")
+        else:
+            st.info("Statuta tidak/belum ditemukan melarang secara tegas (F1 tetap berlaku sebagai indikasi umum).")
+    elif kel == "F3":
+        c1, c2 = st.columns(2)
+        c1.metric("Lama menjabat", f"{r['lama_tahun']} tahun")
+        c2.metric("Batas statuta", f"{r['masa_jabatan_rektor_tahun']} tahun ({r['versi_statuta']})")
+        st.write(f"**{r['nama_lengkap']}** menjabat {r['jabatan_pt']} sejak {tgl(r['tgl_mulai'])}.")
+    elif kel == "F6":
+        c1, c2 = st.columns(2)
+        c1.metric("Lama menjabat", f"{r['lama_tahun']} tahun (dari {r['masa_jabatan_rektor_tahun']} tahun)")
+        c2.metric("Alasan tercatat", r.get("alasan_berhenti") or "-")
+        st.write(f"**{r['nama_lengkap']}** ({r['jabatan_pt']}) berhenti {tgl(r['tgl_akhir'])}, "
+                f"dokumen proses pemberhentian: {r.get('ada_dok_pemberhentian','-')}.")
+    elif kel == "F7":
+        st.metric("Lewat masa jabatan", f"{r['bulan_lewat']} bulan")
+        st.write(f"**{r['nama_lengkap']}** ({r['jabatan_yayasan']}) di {r.get('nama_yayasan','-')}, "
+                f"masa jabatan berakhir {tgl(r['tgl_akhir'])} tanpa akta pembaruan yang tercatat.")
+
+    st.markdown("#### Tinjauan pakar")
+    st.caption("Tersimpan ke: " + ("tabel `status_temuan` di database" if engine is not None
+                                   else "file `status_temuan.csv` lokal (mode demo, tidak permanen di cloud)"))
+    riwayat = status_df.loc[r["id_temuan"]] if r["id_temuan"] in status_df.index else None
+    with st.form(f"tinjau_{idx}"):
+        baru = st.selectbox("Status", STATUS_OPSI, index=STATUS_OPSI.index(r["status"]))
+        catatan = st.text_area("Catatan pemeriksa", value=riwayat["catatan"] if riwayat is not None else "")
+        pemeriksa = st.text_input("Pemeriksa", value=riwayat["pemeriksa"] if riwayat is not None else "")
+        if st.form_submit_button("Simpan"):
+            simpan_status(r["id_temuan"], baru, catatan, pemeriksa, engine)
+            st.rerun()
+    if riwayat is not None:
+        st.caption(f"Terakhir diperbarui {riwayat['waktu']} oleh {riwayat['pemeriksa'] or '-'}")
